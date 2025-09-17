@@ -17,8 +17,9 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -32,6 +33,16 @@ except ImportError:  # pragma: no cover - 在运行前提示缺少依赖
 
 
 QueueItem = Tuple[str, str]
+
+
+@dataclass
+class SendRow:
+    """发送区中的一行配置。"""
+
+    frame: ttk.Frame
+    index_label: ttk.Label
+    select_var: tk.BooleanVar
+    entry: ttk.Entry
 
 
 class SerialDebuggerApp:
@@ -48,16 +59,18 @@ class SerialDebuggerApp:
 
         self.master = master
         self.master.title("串口调试助手")
-        self.master.geometry("820x600")
-        self.master.minsize(720, 480)
+        self.master.geometry("820x620")
+        self.master.minsize(720, 520)
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
         self.status_var = tk.StringVar(value="未连接")
         self.newline_var = tk.BooleanVar(value=True)
+        self.loop_var = tk.BooleanVar(value=False)
         self.log_var = tk.BooleanVar(value=False)
         self.log_path_var = tk.StringVar(value="未选择")
+        self.loop_interval_var = tk.StringVar(value="1000")
 
         self.serial_port: Optional[serial.Serial] = None
         self.reader_thread: Optional[threading.Thread] = None
@@ -65,6 +78,12 @@ class SerialDebuggerApp:
         self.read_queue: "queue.Queue[QueueItem]" = queue.Queue()
 
         self.log_file_path: Optional[Path] = None
+        self.send_rows: List["SendRow"] = []
+        self.loop_selected_rows: List["SendRow"] = []
+        self.loop_job: Optional[str] = None
+        self.loop_index = 0
+        self.loop_running = False
+        self.loop_delay_ms = 1000
 
         self._build_widgets()
         self.refresh_ports()
@@ -75,6 +94,9 @@ class SerialDebuggerApp:
     # ------------------------------------------------------------------
     def _build_widgets(self) -> None:
         self.master.columnconfigure(0, weight=1)
+        self.master.rowconfigure(2, weight=2)
+        self.master.rowconfigure(3, weight=3)
+        self.master.rowconfigure(4, weight=2)
 
         conn_frame = ttk.LabelFrame(self.master, text="连接设置")
         conn_frame.grid(row=0, column=0, padx=12, pady=(10, 5), sticky="nsew")
@@ -126,7 +148,7 @@ class SerialDebuggerApp:
         text_container.columnconfigure(0, weight=1)
         text_container.rowconfigure(0, weight=1)
 
-        self.receive_text = tk.Text(text_container, height=16, wrap="word", state="disabled", font=("Consolas", 10))
+        self.receive_text = tk.Text(text_container, height=12, wrap="word", state="disabled", font=("Consolas", 10))
         self.receive_text.grid(row=0, column=0, sticky="nsew")
 
         text_scroll = ttk.Scrollbar(text_container, orient="vertical", command=self.receive_text.yview)
@@ -134,18 +156,35 @@ class SerialDebuggerApp:
         self.receive_text.configure(yscrollcommand=text_scroll.set)
 
         send_frame = ttk.LabelFrame(self.master, text="发送区")
-        send_frame.grid(row=3, column=0, padx=12, pady=5, sticky="ew")
+        send_frame.grid(row=3, column=0, padx=12, pady=5, sticky="nsew")
         send_frame.columnconfigure(0, weight=1)
+        send_frame.rowconfigure(1, weight=1)
 
-        self.send_entry = ttk.Entry(send_frame)
-        self.send_entry.grid(row=0, column=0, padx=6, pady=6, sticky="ew")
-        self.send_entry.bind("<Return>", lambda event: self.send_data())
+        control_bar = ttk.Frame(send_frame)
+        control_bar.grid(row=0, column=0, padx=6, pady=(6, 3), sticky="ew")
+        control_bar.columnconfigure(4, weight=1)
 
-        send_btn = ttk.Button(send_frame, text="发送", command=self.send_data)
-        send_btn.grid(row=0, column=1, padx=6, pady=6)
+        add_row_btn = ttk.Button(control_bar, text="添加发送行", command=self.add_send_row)
+        add_row_btn.grid(row=0, column=0, padx=(0, 6))
+
+        send_selected_btn = ttk.Button(control_bar, text="发送选中", command=self.send_selected_rows_once)
+        send_selected_btn.grid(row=0, column=1, padx=(0, 6))
+
+        loop_check = ttk.Checkbutton(control_bar, text="自动循环发送", variable=self.loop_var, command=self.toggle_loop_send)
+        loop_check.grid(row=0, column=2, padx=(0, 6))
+
+        ttk.Label(control_bar, text="间隔(ms):").grid(row=0, column=3, padx=(0, 3))
+        interval_entry = ttk.Entry(control_bar, textvariable=self.loop_interval_var, width=8)
+        interval_entry.grid(row=0, column=4, padx=(0, 6), sticky="w")
+
+        self.send_rows_container = ttk.Frame(send_frame)
+        self.send_rows_container.grid(row=1, column=0, padx=6, pady=3, sticky="nsew")
+        self.send_rows_container.columnconfigure(0, weight=1)
 
         newline_check = ttk.Checkbutton(send_frame, text="自动换行 (\r\n)", variable=self.newline_var)
-        newline_check.grid(row=0, column=2, padx=6, pady=6)
+        newline_check.grid(row=2, column=0, padx=6, pady=(0, 6), sticky="w")
+
+        self.add_send_row()
 
         cmd_frame = ttk.LabelFrame(self.master, text="命令列表")
         cmd_frame.grid(row=4, column=0, padx=12, pady=(5, 12), sticky="nsew")
@@ -236,6 +275,8 @@ class SerialDebuggerApp:
         self.queue_message("INFO", f"串口 {port} 已打开")
 
     def disconnect_serial(self) -> None:
+        if self.loop_running:
+            self.stop_loop_send()
         self.running = False
         if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1.5)
@@ -348,10 +389,143 @@ class SerialDebuggerApp:
     # ------------------------------------------------------------------
     # 发送数据与命令列表
     # ------------------------------------------------------------------
-    def send_data(self) -> None:
-        text = self.send_entry.get().strip()
-        self.send_entry.delete(0, tk.END)
+    def add_send_row(self, preset: str = "") -> None:
+        row_frame = ttk.Frame(self.send_rows_container)
+        row_frame.columnconfigure(2, weight=1)
+
+        select_var = tk.BooleanVar(value=False)
+        select_btn = ttk.Checkbutton(row_frame, variable=select_var)
+        select_btn.grid(row=0, column=0, padx=(0, 4), pady=3)
+
+        index_label = ttk.Label(row_frame, width=3, anchor="e")
+        index_label.grid(row=0, column=1, padx=(0, 6))
+
+        entry = ttk.Entry(row_frame)
+        entry.grid(row=0, column=2, padx=(0, 6), pady=3, sticky="ew")
+        if preset:
+            entry.insert(0, preset)
+
+        send_btn = ttk.Button(row_frame, text="发送")
+        send_btn.grid(row=0, column=3, padx=(0, 6))
+
+        delete_btn = ttk.Button(row_frame, text="删除")
+        delete_btn.grid(row=0, column=4)
+
+        row = SendRow(frame=row_frame, index_label=index_label, select_var=select_var, entry=entry)
+        self.send_rows.append(row)
+
+        send_btn.configure(command=lambda r=row: self.send_row_text(r))
+        delete_btn.configure(command=lambda r=row: self.remove_send_row(r))
+        entry.bind("<Return>", lambda event, r=row: self.send_row_text(r))
+
+        self.update_send_rows_layout()
+
+    def update_send_rows_layout(self) -> None:
+        for idx, row in enumerate(self.send_rows, start=1):
+            row.index_label.configure(text=str(idx))
+            row.frame.grid(row=idx - 1, column=0, sticky="ew")
+
+    def remove_send_row(self, row: SendRow) -> None:
+        if row not in self.send_rows:
+            return
+        if self.loop_running:
+            self.stop_loop_send()
+        row.frame.destroy()
+        self.send_rows.remove(row)
+        if not self.send_rows:
+            self.add_send_row()
+        else:
+            self.update_send_rows_layout()
+
+    def send_row_text(self, row: SendRow) -> None:
+        text = row.entry.get()
+        if not text:
+            return
         self.send_text(text)
+
+    def send_selected_rows_once(self) -> None:
+        selected = [row for row in self.send_rows if row.select_var.get()]
+        if not selected:
+            messagebox.showinfo("发送选中", "请先勾选需要发送的行")
+            return
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("串口未打开", "请先打开串口后再发送数据")
+            return
+        for row in selected:
+            self.send_row_text(row)
+
+    def toggle_loop_send(self) -> None:
+        if self.loop_var.get():
+            self.start_loop_send()
+        else:
+            self.stop_loop_send()
+
+    def start_loop_send(self) -> None:
+        if self.loop_running:
+            self.stop_loop_send()
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("串口未打开", "请先打开串口后再开始循环发送")
+            self.loop_var.set(False)
+            return
+
+        selected = [row for row in self.send_rows if row.select_var.get()]
+        if not selected:
+            messagebox.showinfo("循环发送", "请至少勾选一行发送内容")
+            self.loop_var.set(False)
+            return
+
+        try:
+            interval = int(self.loop_interval_var.get())
+        except ValueError:
+            messagebox.showerror("参数错误", "间隔必须是非负整数")
+            self.loop_var.set(False)
+            return
+
+        if interval < 0:
+            messagebox.showerror("参数错误", "间隔必须是非负整数")
+            self.loop_var.set(False)
+            return
+
+        self.loop_delay_ms = interval
+        self.loop_selected_rows = selected
+        self.loop_index = 0
+        self.loop_running = True
+        self.perform_loop_step()
+
+    def perform_loop_step(self) -> None:
+        if not self.loop_running:
+            return
+        if not self.serial_port or not self.serial_port.is_open:
+            messagebox.showwarning("串口未打开", "串口已关闭，停止循环发送")
+            self.stop_loop_send()
+            return
+        if not self.loop_selected_rows:
+            self.stop_loop_send()
+            return
+
+        row = self.loop_selected_rows[self.loop_index]
+        self.loop_index = (self.loop_index + 1) % len(self.loop_selected_rows)
+        text = row.entry.get()
+        if text:
+            self.send_text(text)
+
+        delay = max(self.loop_delay_ms, 0)
+        if delay == 0:
+            self.loop_job = self.master.after_idle(self.perform_loop_step)
+        else:
+            self.loop_job = self.master.after(delay, self.perform_loop_step)
+
+    def stop_loop_send(self) -> None:
+        if self.loop_job is not None:
+            try:
+                self.master.after_cancel(self.loop_job)
+            except ValueError:
+                pass
+            self.loop_job = None
+        self.loop_running = False
+        self.loop_selected_rows = []
+        if self.loop_var.get():
+            self.loop_var.set(False)
 
     def send_text(self, text: str) -> None:
         if not text:
